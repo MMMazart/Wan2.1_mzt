@@ -100,6 +100,7 @@ def _parse_args():
     parser = argparse.ArgumentParser(
         description="Generate a image or video from a text prompt or image using Wan"
     )
+    #选择任务，choices=list(WAN_CONFIGS.keys()),
     parser.add_argument(
         "--task",
         type=str,
@@ -113,6 +114,7 @@ def _parse_args():
         choices=list(SIZE_CONFIGS.keys()),
         help="The area (width*height) of the generated video. For the I2V task, the aspect ratio of the output video will follow that of the input image."
     )
+    #Frame数量，4n+1
     parser.add_argument(
         "--frame_num",
         type=int,
@@ -130,6 +132,7 @@ def _parse_args():
         default=None,
         help="Whether to offload the model to CPU after each model forward, reducing GPU memory usage."
     )
+    #推理减少内存的变量
     parser.add_argument(
         "--ulysses_size",
         type=int,
@@ -155,21 +158,25 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Whether to use FSDP for DiT.")
+    #生成视频存储位置
     parser.add_argument(
         "--save_file",
         type=str,
         default=None,
         help="The file to save the generated image or video to.")
+    #source video,视频编辑任务
     parser.add_argument(
         "--src_video",
         type=str,
         default=None,
         help="The file of the source video. Default None.")
+    #不知道干嘛的
     parser.add_argument(
         "--src_mask",
         type=str,
         default=None,
         help="The file of the source mask. Default None.")
+    #不知道这个干嘛的
     parser.add_argument(
         "--src_ref_images",
         type=str,
@@ -181,11 +188,13 @@ def _parse_args():
         type=str,
         default=None,
         help="The prompt to generate the image or video from.")
+    #是否用大语言模型扩展
     parser.add_argument(
         "--use_prompt_extend",
         action="store_true",
         default=False,
         help="Whether to use prompt extend.")
+    #用啥大语言模型
     parser.add_argument(
         "--prompt_extend_method",
         type=str,
@@ -197,12 +206,14 @@ def _parse_args():
         type=str,
         default=None,
         help="The prompt extend model to use.")
+    #目标语言中文还是英文
     parser.add_argument(
         "--prompt_extend_target_lang",
         type=str,
         default="zh",
         choices=["zh", "en"],
         help="The target language of prompt extend.")
+    #随机种子
     parser.add_argument(
         "--base_seed",
         type=int,
@@ -231,8 +242,10 @@ def _parse_args():
         default='unipc',
         choices=['unipc', 'dpm++'],
         help="The solver used to sample.")
+    #采样步数
     parser.add_argument(
         "--sample_steps", type=int, default=None, help="The sampling steps.")
+    #不懂
     parser.add_argument(
         "--sample_shift",
         type=float,
@@ -264,16 +277,21 @@ def _init_logging(rank):
 
 
 def generate(args):
-    rank = int(os.getenv("RANK", 0))
-    world_size = int(os.getenv("WORLD_SIZE", 1))
-    local_rank = int(os.getenv("LOCAL_RANK", 0))
+    #通过环境变量获取当前进程的 rank（全局编号）、local_rank（机器内编号）、world_size（总进程数）
+    rank = int(os.getenv("RANK", 0))   #每个进程的唯一编号（从 0 到 15）
+    world_size = int(os.getenv("WORLD_SIZE", 1))    #参与训练的总进程数，一般和GPT数量相同
+    local_rank = int(os.getenv("LOCAL_RANK", 0))    #当前进程在本地机器上的编号
     device = local_rank
+    #设置当前进程的 log 输出（只有 rank=0 输出 INFO）
     _init_logging(rank)
-
+    
+    #如果未指定是否将模型 forward 后移到 CPU，就根据是否是多卡环境决定
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}.")
+    #多机多卡下初始化分布式通信环境
+    #非分布式环境下禁止使用 FSDP、Ulysses 等分布式模型并行机制
     if world_size > 1:
         torch.cuda.set_device(local_rank)
         dist.init_process_group(
@@ -288,7 +306,7 @@ def generate(args):
         assert not (
             args.ulysses_size > 1 or args.ring_size > 1
         ), f"context parallel are not supported in non-distributed environments."
-
+    #初始化自定义并行模型结构（Ulysses + Ring Attention）
     if args.ulysses_size > 1 or args.ring_size > 1:
         assert args.ulysses_size * args.ring_size == world_size, f"The number of ulysses_size and ring_size should be equal to the world size."
         from xfuser.core.distributed import (
@@ -303,7 +321,7 @@ def generate(args):
             ring_degree=args.ring_size,
             ulysses_degree=args.ulysses_size,
         )
-
+    #prompt扩写，是否使用视觉语言模型由任务名是否含 i2v、flf2v 决定，这个有疑问
     if args.use_prompt_extend:
         if args.prompt_extend_method == "dashscope":
             prompt_expander = DashScopePromptExpander(
@@ -318,6 +336,7 @@ def generate(args):
             raise NotImplementedError(
                 f"Unsupport prompt_extend_method: {args.prompt_extend_method}")
 
+    #这里是通过字典的方式获取了wan.configs里的参数
     cfg = WAN_CONFIGS[args.task]
     if args.ulysses_size > 1:
         assert cfg.num_heads % args.ulysses_size == 0, f"`{cfg.num_heads=}` cannot be divided evenly by `{args.ulysses_size=}`."
