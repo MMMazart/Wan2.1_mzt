@@ -17,6 +17,7 @@ flf2v_14B = copy.deepcopy(i2v_14B)
 flf2v_14B.__name__ = 'Config: Wan FLF2V 14B'
 flf2v_14B.sample_neg_prompt = "镜头切换，" + flf2v_14B.sample_neg_prompt
 
+#一个5个参数库，导入了3个，deepcopy了2个
 WAN_CONFIGS = {
     't2v-14B': t2v_14B,
     't2v-1.3B': t2v_1_3B,
