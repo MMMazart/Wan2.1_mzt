@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from functools import partial
 
 import torch
-import torch.cuda.amp as amp
+import torch.cuda.amp as amp   #混合精度模块
 import torch.distributed as dist
 from tqdm import tqdm
 
@@ -43,8 +43,8 @@ class WanT2V:
         Initializes the Wan text-to-video generation model components.
 
         Args:
-            config (EasyDict):
-                Object containing model parameters initialized from config.py
+            config (EasyDict): 模型初始化参数
+                Object containing model parameters initialized from config.py 
             checkpoint_dir (`str`):
                 Path to directory containing model checkpoints
             device_id (`int`,  *optional*, defaults to 0):
@@ -63,22 +63,33 @@ class WanT2V:
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
         self.rank = rank
-        self.t5_cpu = t5_cpu
+        self.t5_cpu = t5_cpu #是否将 T5 模型放在 CPU 上运行，节省显存
+        ```
+        虽然训练用了 1000 步，但推理时只采样 50 步，是因为：
+        采样调度器会从这1000步中"智能采样出50步"来进行近似反演，从而提升速度。
+        这叫 近似采样 / Subsampling，是扩散模型推理加速的常规做法。
+        ```
+        self.num_train_timesteps = config.num_train_timesteps  #扩散训练时使用的最大时间步数，控制模型学习的分辨能力，这个inference时只要50，有些不懂
+        self.param_dtype = config.param_dtype  #一般使用bf16，指数范围与float32相同，更稳定，尾数精度略低 → 理论上精度略受损，但通常实际影响不大
 
-        self.num_train_timesteps = config.num_train_timesteps
-        self.param_dtype = config.param_dtype
-
-        shard_fn = partial(shard_model, device_id=device_id)
+        shard_fn = partial(shard_model, device_id=device_id) #不明白,封装 shard_model() 函数，用于 模型切分（FSDP），适配多 GPU 分布式。
         self.text_encoder = T5EncoderModel(
-            text_len=config.text_len,
+            text_len=config.text_len,  #wan_shared_cfg.text_len = 512
             dtype=config.t5_dtype,
             device=torch.device('cpu'),
             checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
             shard_fn=shard_fn if t5_fsdp else None)
 
-        self.vae_stride = config.vae_stride
-        self.patch_size = config.patch_size
+        self.vae_stride = config.vae_stride  #表示 VAE 编码器对视频输入做了多少倍的下采样（stride），三维元组 (T_stride, H_stride, W_stride)
+        ```
+        vae_stride = (4, 8, 8)
+        原始输入视频尺寸：(3, 81, 720, 1280)
+        ↓ 编码后变为：
+        latent 尺寸：(C, 81//4 + 1, 720//8, 1280//8)
+             = (C, 21, 90, 160)
+        ```
+        self.patch_size = config.patch_size   #表示 在 transformer 模型中，用于将 latent 分成多大 patch（块）进行建模，对应：
         self.vae = WanVAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
@@ -101,7 +112,8 @@ class WanT2V:
             self.sp_size = get_sequence_parallel_world_size()
         else:
             self.sp_size = 1
-
+            
+        #同步屏障，等所有进程运行到此，再进行模型切分或直接加载。
         if dist.is_initialized():
             dist.barrier()
         if dit_fsdp:
@@ -157,16 +169,26 @@ class WanT2V:
         """
         # preprocess
         F = frame_num
+
+        #计算视频经过 VAE 编码器压缩后的形状，供模型生成latent                     
         target_shape = (self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
                         size[1] // self.vae_stride[1],
                         size[0] // self.vae_stride[2])
-
+        #估算经过 VAE 下采样并划分 patch 后的 token 数（即 transformer 的输入序列长度）
         seq_len = math.ceil((target_shape[2] * target_shape[3]) /
                             (self.patch_size[1] * self.patch_size[2]) *
                             target_shape[1] / self.sp_size) * self.sp_size
 
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
+
+        ```
+        torch.Generator 是一个显式、可控的随机数生成器对象
+        它允许你在多个地方使用 同一个生成器产生一致的随机数
+        适用于：
+        多次调用 torch.randn 生成不同张量
+        保证每个 batch、每帧都可控                 
+        ```
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
@@ -182,7 +204,7 @@ class WanT2V:
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
-
+        #初始化噪声 latent
         noise = [
             torch.randn(
                 target_shape[0],
@@ -193,7 +215,7 @@ class WanT2V:
                 device=self.device,
                 generator=seed_g)
         ]
-
+        #？？？
         @contextmanager
         def noop_no_sync():
             yield
@@ -223,12 +245,12 @@ class WanT2V:
                     sigmas=sampling_sigmas)
             else:
                 raise NotImplementedError("Unsupported solver.")
-
-            # sample videos
+            
+            # sample videos  扩散反演（采样主循环）
             latents = noise
 
             arg_c = {'context': context, 'seq_len': seq_len}
-            arg_null = {'context': context_null, 'seq_len': seq_len}
+            arg_null = {'context': context_null, 'seq_len': seq_len}  #neg_prompt
 
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
@@ -241,10 +263,12 @@ class WanT2V:
                     latent_model_input, t=timestep, **arg_c)[0]
                 noise_pred_uncond = self.model(
                     latent_model_input, t=timestep, **arg_null)[0]
-
+                
+                #cfg公式
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
-
+                
+                #将预测的噪声通过 scheduler 推一小步，得到更新的 latent
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
                     t,
