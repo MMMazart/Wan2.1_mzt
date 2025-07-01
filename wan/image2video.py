@@ -178,20 +178,25 @@ class WanI2V:
                 - H: Frame height (from max_area)
                 - W: Frame width from max_area)
         """
+        #将 PIL 图像转换为 [C, H, W] 的 Tensor，并标准化到 [-1, 1],VAE和CLIP模型输入要求的格式
         img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
 
+        #获取帧数、图像分辨率、高宽比
         F = frame_num
         h, w = img.shape[1:]
         aspect_ratio = h / w
+
+        # H × W ≈ max_area, H / W = aspect_ratio
         lat_h = round(
             np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] //
             self.patch_size[1] * self.patch_size[1])
         lat_w = round(
             np.sqrt(max_area / aspect_ratio) // self.vae_stride[2] //
             self.patch_size[2] * self.patch_size[2])
+        #推导实际 VAE 解码图像大小
         h = lat_h * self.vae_stride[1]
         w = lat_w * self.vae_stride[2]
-
+        # ((F - 1) // self.vae_stride[0] + 1)压缩后的laten_t数量+1
         max_seq_len = ((F - 1) // self.vae_stride[0] + 1) * lat_h * lat_w // (
             self.patch_size[1] * self.patch_size[2])
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
@@ -199,6 +204,7 @@ class WanI2V:
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
+        #通道数为 16，对应 latent z_dim
         noise = torch.randn(
             16, (F - 1) // 4 + 1,
             lat_h,
@@ -207,12 +213,16 @@ class WanI2V:
             generator=seed_g,
             device=self.device)
 
-        msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
+        #构造首帧 Mask，第一帧设为 1，后续为 0，表示“仅首帧锁定”
+        msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)  #batchsize为1
         msk[:, 1:] = 0
+        ```
+        torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1),shape = (1, 4, H, W)
+        把第 0 帧的 mask 沿着时间维（dim=1）复制 4 次，形成一个 4 帧的 block，用于拼接进 transformer 的 patch token 输入中。
+        ```
         msk = torch.concat([
             torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
-        ],
-                           dim=1)
+        ],dim=1)   #(1, 84, H, W)
         msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
         msk = msk.transpose(1, 2)[0]
 
