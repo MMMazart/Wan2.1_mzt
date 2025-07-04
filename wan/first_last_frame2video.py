@@ -159,7 +159,7 @@ class WanFLF2V:
                 Maximum pixel area for latent space calculation. Controls video resolution scaling
             frame_num (`int`, *optional*, defaults to 81):
                 How many frames to sample from a video. The number should be 4n+1
-            shift (`float`, *optional*, defaults to 5.0):
+            shift (`float`, *optional*, defaults to 5.0): shift 控制时间维度上的噪声变化速度 → 影响生成视频的运动幅度和动态节奏。
                 Noise schedule shift parameter. Affects temporal dynamics
                 [NOTE]: If you want to generate a 480p video, it is recommended to set the shift value to 3.0.
             sample_solver (`str`, *optional*, defaults to 'unipc'):
@@ -201,6 +201,8 @@ class WanFLF2V:
             self.patch_size[2] * self.patch_size[2])
         first_frame_h = lat_h * self.vae_stride[1]
         first_frame_w = lat_w * self.vae_stride[2]
+
+        #若首尾帧尺寸不同，强行 resize + center crop
         if first_frame_size != last_frame_size:
             # 1. resize
             last_frame_resize_ratio = max(
@@ -227,7 +229,7 @@ class WanFLF2V:
             dtype=torch.float32,
             generator=seed_g,
             device=self.device)
-
+        #构造时间掩码 mask（首帧和尾帧设为 1）
         msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
         msk[:, 1:-1] = 0
         msk = torch.concat([
@@ -236,7 +238,11 @@ class WanFLF2V:
                            dim=1)
         msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
         msk = msk.transpose(1, 2)[0]
-
+        ```
+        最终供 Transformer 输入的 mask 形状为(4, 21, lat_h, lat_h)，因为Wan2.1 的时空扩散模型（DiT结构）采用了如下的 video patch 分组方式
+        将 msk 中的时间维（84 帧）按每组 4 帧切分，重组为一个形状与时空 Transformer patch 分组一致的张量格式。
+        ```
+               
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
@@ -258,7 +264,7 @@ class WanFLF2V:
             [first_frame[:, None, :, :], last_frame[:, None, :, :]])
         if offload_model:
             self.clip.model.cpu()
-
+        ##torch.concat([首帧, 零帧，尾帧], dim=1),→ shape = (3, F, h, w)，这里的y形状应该是16(C),21(F//4+1),lat_h,lat_w
         y = self.vae.encode([
             torch.concat([
                 torch.nn.functional.interpolate(
@@ -272,9 +278,9 @@ class WanFLF2V:
                     mode='bicubic').transpose(0, 1),
             ],
                          dim=1).to(self.device)
-        ])[0]
+        ])[0]    
         y = torch.concat([msk, y])
-
+        
         @contextmanager
         def noop_no_sync():
             yield
