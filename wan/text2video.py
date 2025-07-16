@@ -64,11 +64,11 @@ class WanT2V:
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu #是否将 T5 模型放在 CPU 上运行，节省显存
-        ```
+        '''
         虽然训练用了 1000 步，但推理时只采样 50 步，是因为：
         采样调度器会从这1000步中"智能采样出50步"来进行近似反演，从而提升速度。
         这叫 近似采样 / Subsampling，是扩散模型推理加速的常规做法。
-        ```
+        '''
         self.num_train_timesteps = config.num_train_timesteps  #扩散训练时使用的最大时间步数，控制模型学习的分辨能力，这个inference时只要50，有些不懂
         self.param_dtype = config.param_dtype  #一般使用bf16，指数范围与float32相同，更稳定，尾数精度略低 → 理论上精度略受损，但通常实际影响不大
 
@@ -82,13 +82,13 @@ class WanT2V:
             shard_fn=shard_fn if t5_fsdp else None)
 
         self.vae_stride = config.vae_stride  #表示 VAE 编码器对视频输入做了多少倍的下采样（stride），三维元组 (T_stride, H_stride, W_stride)
-        ```
+        '''
         vae_stride = (4, 8, 8)
         原始输入视频尺寸：(3, 81, 720, 1280)
         ↓ 编码后变为：
         latent 尺寸：(C, 81//4 + 1, 720//8, 1280//8)
              = (C, 21, 90, 160)
-        ```
+        '''
         self.patch_size = config.patch_size   #表示 在 transformer 模型中，用于将 latent 分成多大 patch（块）进行建模，对应：
         self.vae = WanVAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
@@ -182,13 +182,13 @@ class WanT2V:
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
-        ```
+        '''
         torch.Generator 是一个显式、可控的随机数生成器对象
         它允许你在多个地方使用 同一个生成器产生一致的随机数
         适用于：
         多次调用 torch.randn 生成不同张量
         保证每个 batch、每帧都可控                 
-        ```
+        '''
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
