@@ -178,20 +178,25 @@ class WanI2V:
                 - H: Frame height (from max_area)
                 - W: Frame width from max_area)
         """
+        #将 PIL 图像转换为 [C, H, W] 的 Tensor，并标准化到 [-1, 1],VAE和CLIP模型输入要求的格式
         img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
 
+        #获取帧数、图像分辨率、高宽比
         F = frame_num
         h, w = img.shape[1:]
         aspect_ratio = h / w
+
+        # H × W ≈ max_area, H / W = aspect_ratio
         lat_h = round(
             np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] //
             self.patch_size[1] * self.patch_size[1])
         lat_w = round(
             np.sqrt(max_area / aspect_ratio) // self.vae_stride[2] //
             self.patch_size[2] * self.patch_size[2])
+        #推导实际 VAE 解码图像大小
         h = lat_h * self.vae_stride[1]
         w = lat_w * self.vae_stride[2]
-
+        # ((F - 1) // self.vae_stride[0] + 1)压缩后的laten_t数量+1
         max_seq_len = ((F - 1) // self.vae_stride[0] + 1) * lat_h * lat_w // (
             self.patch_size[1] * self.patch_size[2])
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
@@ -199,6 +204,7 @@ class WanI2V:
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
+        #通道数为 16，对应 latent z_dim
         noise = torch.randn(
             16, (F - 1) // 4 + 1,
             lat_h,
@@ -207,14 +213,22 @@ class WanI2V:
             generator=seed_g,
             device=self.device)
 
-        msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
+        #构造首帧 Mask，第一帧设为 1，后续为 0，表示“仅首帧锁定”
+        msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)  #batchsize为1
         msk[:, 1:] = 0
+        '''
+        torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1),shape = (1, 4, lat_h, lat_h)
+        把第 0 帧的 mask 沿着时间维（dim=1）复制 4 次，形成一个 4 帧的 block，用于拼接进 transformer 的 patch token 输入中。
+        '''
         msk = torch.concat([
             torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
-        ],
-                           dim=1)
-        msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
-        msk = msk.transpose(1, 2)[0]
+        ],dim=1)   #(1, 84, H, W)
+        msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w) #msk = msk.view(1, 21, 4, lat_h, lat_h)  # 分组 reshape，每组 4 帧
+        msk = msk.transpose(1, 2)[0]  
+        '''
+         最终供 Transformer 输入的 mask 形状为(4, 21, lat_h, lat_h)，因为Wan2.1 的时空扩散模型（DiT结构）采用了如下的 video patch 分组方式
+        将 msk 中的时间维（84 帧）按每组 4 帧切分，重组为一个形状与时空 Transformer patch 分组一致的张量格式。
+        '''
 
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
@@ -233,10 +247,13 @@ class WanI2V:
             context_null = [t.to(self.device) for t in context_null]
 
         self.clip.model.to(self.device)
-        clip_context = self.clip.visual([img[:, None, :, :]])
+        clip_context = self.clip.visual([img[:, None, :, :]])  
+        #将图像编码为视觉语义特征（shape 类似于 [B, 768]），clip_context.shape ≈ (1, 768)  # 或者多层特征，视模型结构而定
+        # img[:, None, :, :] → 插入一个时间维，变成 (3, 1, H, W)，外部再用list包一层，最后最后输入shape是[1,3,1,H,W]
         if offload_model:
             self.clip.model.cpu()
-
+        #这里h,w已经变成了推导后的实际vae，所以img要进行插值
+        #torch.concat([首帧, 零帧], dim=1),→ shape = (3, F, h, w)，这里的y形状应该是16(C),21(F//4+1),lat_h,lat_w
         y = self.vae.encode([
             torch.concat([
                 torch.nn.functional.interpolate(
@@ -245,9 +262,9 @@ class WanI2V:
                 torch.zeros(3, F - 1, h, w)
             ],
                          dim=1).to(self.device)
-        ])[0]
-        y = torch.concat([msk, y])
-
+        ])[0]   
+        y = torch.concat([msk, y])   #这里concat后是20,21,lat_h,lat_w
+        # y 是 将输入图像 + 时间 mask 编码为 latent 特征图，用于在每一帧生成过程中作为视觉条件。
         @contextmanager
         def noop_no_sync():
             yield
