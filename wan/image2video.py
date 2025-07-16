@@ -216,19 +216,19 @@ class WanI2V:
         #构造首帧 Mask，第一帧设为 1，后续为 0，表示“仅首帧锁定”
         msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)  #batchsize为1
         msk[:, 1:] = 0
-        ```
+        '''
         torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1),shape = (1, 4, lat_h, lat_h)
         把第 0 帧的 mask 沿着时间维（dim=1）复制 4 次，形成一个 4 帧的 block，用于拼接进 transformer 的 patch token 输入中。
-        ```
+        '''
         msk = torch.concat([
             torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
         ],dim=1)   #(1, 84, H, W)
         msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w) #msk = msk.view(1, 21, 4, lat_h, lat_h)  # 分组 reshape，每组 4 帧
         msk = msk.transpose(1, 2)[0]  
-            ```
+        '''
          最终供 Transformer 输入的 mask 形状为(4, 21, lat_h, lat_h)，因为Wan2.1 的时空扩散模型（DiT结构）采用了如下的 video patch 分组方式
         将 msk 中的时间维（84 帧）按每组 4 帧切分，重组为一个形状与时空 Transformer patch 分组一致的张量格式。
-        ```
+        '''
 
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
